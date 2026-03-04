@@ -1,9 +1,12 @@
 ﻿import os
 import numpy as np
 import pandas as pd
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 
 IN_PATH = "data/processed/driver_performance_2024.csv"
 OUT_PATH = "data/processed/driver_metrics_2024.csv"
+CLUSTER_OUT_PATH = "data/processed/driver_clusters_2024.csv"
 
 os.makedirs("data/processed", exist_ok=True)
 
@@ -225,7 +228,6 @@ def best_track_type(row):
 
 
 track_features["SpecialistTrackType"] = track_features.apply(best_track_type, axis=1)
-
 metrics = metrics.merge(track_features, on="Driver", how="left")
 
 # Phase 4B: Teammate comparison by track type.
@@ -261,6 +263,72 @@ driver_effect = (
 
 delta_pivot = delta_pivot.merge(driver_effect, on="Driver", how="left")
 metrics = metrics.merge(delta_pivot, on="Driver", how="left")
+
+# Phase 6: Driver clustering.
+cluster_feature_cols = [
+    "AvgNormalizedPace",
+    "ConsistencyStdSec",
+    "AvgDegradationSlopeSecPerLap",
+    "RaceMinusQualiDelta",
+]
+cluster_base_cols = ["Driver", "Team"] + cluster_feature_cols
+clusters_df = metrics[cluster_base_cols].copy()
+
+# Fill sparse feature values with medians to keep all drivers clusterable.
+for col in cluster_feature_cols:
+    clusters_df[col] = pd.to_numeric(clusters_df[col], errors="coerce")
+    clusters_df[col] = clusters_df[col].fillna(clusters_df[col].median())
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(clusters_df[cluster_feature_cols])
+
+n_clusters = min(4, len(clusters_df))
+kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=20)
+clusters_df["ClusterId"] = kmeans.fit_predict(X_scaled).astype(int)
+
+centers_scaled = pd.DataFrame(kmeans.cluster_centers_, columns=cluster_feature_cols)
+# Lower values are better for all four features used here.
+centers_scaled["ClusterScore"] = -centers_scaled.sum(axis=1)
+centers_scaled = (
+    centers_scaled.sort_values("ClusterScore", ascending=False)
+    .reset_index()
+    .rename(columns={"index": "ClusterId"})
+)
+
+cluster_name_order = [
+    "Elite All-Rounders",
+    "Strong Race Managers",
+    "Balanced Midfield",
+    "Developing / Volatile",
+]
+cluster_name_map = {}
+for i, row in centers_scaled.iterrows():
+    label_idx = min(i, len(cluster_name_order) - 1)
+    cluster_name_map[int(row["ClusterId"])] = cluster_name_order[label_idx]
+
+clusters_df["ClusterLabel"] = clusters_df["ClusterId"].map(cluster_name_map)
+
+metrics = metrics.merge(clusters_df[["Driver", "ClusterId", "ClusterLabel"]], on="Driver", how="left")
+metrics["ClusterId"] = metrics["ClusterId"].astype("Int64")
+
+clusters_df = clusters_df.merge(metrics[["Driver", "PaceRank", "ConsistencyRank", "TireManagementRank"]], on="Driver", how="left")
+clusters_df = clusters_df[
+    [
+        "Driver",
+        "Team",
+        "ClusterId",
+        "ClusterLabel",
+        "AvgNormalizedPace",
+        "ConsistencyStdSec",
+        "AvgDegradationSlopeSecPerLap",
+        "RaceMinusQualiDelta",
+        "PaceRank",
+        "ConsistencyRank",
+        "TireManagementRank",
+    ]
+]
+clusters_df = clusters_df.sort_values(["ClusterId", "PaceRank", "Driver"]).reset_index(drop=True)
+clusters_df.to_csv(CLUSTER_OUT_PATH, index=False)
 
 # Optional teammate comparison field requested in Phase 2A.
 metrics["TeamMateDelta"] = metrics["DeltaToTeamAvg"]
@@ -311,6 +379,7 @@ int_cols = [
     "LapsTechnical",
     "LapsHighSpeed",
     "LapsMixed",
+    "ClusterId",
 ]
 for c in int_cols:
     if c in metrics.columns:
@@ -326,3 +395,6 @@ print("NaN counts (top 15):")
 print(metrics.isna().sum().sort_values(ascending=False).head(15).to_dict())
 print("SpecialistTrackType counts:")
 print(metrics["SpecialistTrackType"].value_counts(dropna=False).to_dict())
+print("Saved:", CLUSTER_OUT_PATH)
+print("Cluster counts:")
+print(metrics["ClusterLabel"].value_counts(dropna=False).to_dict())
